@@ -1,0 +1,32 @@
+[package]
+name = "WinNotiCatcher"
+version = "0.1.0"
+edition = "2021"
+
+[target.'cfg(windows)'.rustflags]
+[dependencies]
+csv = "1.2"
+chrono = "0.4"
+# GUI
+eframe = { version = "0.27", default-features = false, features = ["default_fonts", "wgpu", "glow"] }
+egui = "0.27"
+# 非同期処理
+tokio = { version = "1.37", features = ["full"] }
+
+# 永続化用
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+emojis = "0.8.0"
+[dependencies.windows]
+version = "0.58"
+features = [
+    "Foundation_Collections",
+    "UI_Notifications_Management",
+    "UI_Notifications",
+    "ApplicationModel",
+    "ApplicationModel_Core",
+    "Data_Xml_Dom",
+]
+
+[build-dependencies]
+winres = "0.1"

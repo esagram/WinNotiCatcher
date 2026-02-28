@@ -1,0 +1,12 @@
+/target
+Cargo.lock
+*.exe
+*.log
+*.txt
+err.txt
+err_cmd.txt
+error.log
+notifications_history.csv
+logs/
+.DS_Store
+*.zip

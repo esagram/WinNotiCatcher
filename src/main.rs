@@ -7,6 +7,7 @@ use std::fs::{self, OpenOptions};
 use std::io::{self, Write};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
+use std::process::Command;
 use tokio::time::{sleep, Duration};
 
 use chrono::Local;
@@ -18,36 +19,38 @@ use windows::UI::Notifications::{KnownNotificationBindings, NotificationKinds};
 
 const CONFIG_FILE: &str = "tabs_config.json"; // Changed back to old name so we don't create an additional file
 
+static STARTUP_TIME: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+fn get_startup_time() -> &'static str {
+    STARTUP_TIME.get_or_init(|| {
+        chrono::Local::now().format("%Y%m%d_%H%M%S").to_string()
+    })
+}
+
 #[derive(Clone, PartialEq, Serialize, Deserialize)]
-enum RetentionStrategy {
-    KeepAll,
-    KeepLastN(usize),
-    DailyLogs,
+enum DisplayMode {
+    Count(usize),
+    Days(usize),
+}
+
+impl Default for DisplayMode {
+    fn default() -> Self {
+        Self::Days(3)
+    }
 }
 
 #[derive(Clone, Serialize, Deserialize)]
+#[serde(default)]
 struct AppConfig {
-    retention: RetentionStrategy,
+    display_mode: DisplayMode,
     tabs: Vec<String>,
 }
 
 impl Default for AppConfig {
     fn default() -> Self {
         Self {
-            retention: RetentionStrategy::KeepLastN(3000), 
+            display_mode: DisplayMode::default(),
             tabs: vec!["All".to_string()],
         }
-    }
-}
-
-// Helper to get correct log file name based on strategy
-fn get_log_file_path(strategy: &RetentionStrategy) -> PathBuf {
-    match strategy {
-        RetentionStrategy::DailyLogs => {
-            let today = Local::now().format("%Y-%m-%d").to_string();
-            PathBuf::from(format!("logs/notifications_history_{}.csv", today))
-        }
-        _ => PathBuf::from("logs/notifications_history.csv"),
     }
 }
 
@@ -125,7 +128,7 @@ fn highlight_search_text(text: &str, query: &str, default_color: egui::Color32, 
     job
 }
 
-fn log_notifications(listener: &UserNotificationListener, last_known_notifs: &mut HashSet<u32>, config: &AppConfig) -> WinResult<Vec<NotificationRecord>> {
+fn log_notifications(listener: &UserNotificationListener, last_known_notifs: &mut HashSet<u32>, _config: &AppConfig) -> WinResult<Vec<NotificationRecord>> {
     let notifs = listener.GetNotificationsAsync(NotificationKinds::Toast)?.get()?;
     let mut new_notifs_data = Vec::new();
     let mut current_ids = HashSet::new();
@@ -187,7 +190,9 @@ fn log_notifications(listener: &UserNotificationListener, last_known_notifs: &mu
     if !new_notifs_data.is_empty() {
         new_notifs_data.reverse(); // oldest to newest for appending
         
-        let log_file_path = get_log_file_path(&config.retention);
+        let file_name = format!("logs/WinNotiCatcher_log_{}.csv", get_startup_time());
+        let log_file_path = PathBuf::from(file_name);
+        
         let _ = init_csv(&log_file_path);
         
         // Append new lines
@@ -198,47 +203,6 @@ fn log_notifications(listener: &UserNotificationListener, last_known_notifs: &mu
                 }
                 returned_records.push(record.clone());
             }
-        }
-        
-        // Handle KeepLastN pruning logic with Archive
-        if let RetentionStrategy::KeepLastN(max_lines) = config.retention {
-             if log_file_path.exists() {
-                 if let Ok(mut rdr) = csv::ReaderBuilder::new().has_headers(true).from_path(&log_file_path) {
-                     let mut all_records = Vec::new();
-                     for result in rdr.records() {
-                         if let Ok(rec) = result {
-                             all_records.push(rec);
-                         }
-                     }
-                     // If we exceed the limit, rewrite main file to max_lines, append rest to archive
-                     if all_records.len() > max_lines {
-                         let split_at = all_records.len() - max_lines;
-                         
-                         let pruned_records = &all_records[..split_at];
-                         let kept_records = &all_records[split_at..];
-                         
-                         // Append pruned to archive
-                         let archive_path = Path::new("logs/notifications_archive.csv");
-                         let _ = init_csv(archive_path);
-                         if let Ok(arc_file) = OpenOptions::new().append(true).open(archive_path) {
-                             let mut arc_wtr = csv::WriterBuilder::new().has_headers(false).from_writer(arc_file);
-                             for rec in pruned_records {
-                                 let _ = arc_wtr.write_record(rec);
-                             }
-                             let _ = arc_wtr.flush();
-                         }
-                         
-                         // Rewrite active log
-                         if let Ok(mut wtr) = csv::WriterBuilder::new().from_path(&log_file_path) {
-                             let _ = wtr.write_record(&["Timestamp", "App", "Text"]);
-                             for rec in kept_records {
-                                 let _ = wtr.write_record(rec);
-                             }
-                             let _ = wtr.flush();
-                         }
-                     }
-                 }
-             }
         }
     }
 
@@ -267,7 +231,7 @@ async fn run_background_logger(log_history: Arc<Mutex<Vec<NotificationRecord>>>,
     loop {
         let current_config = {
             let conf_guard = config_arc.lock().unwrap();
-            AppConfig { retention: conf_guard.retention.clone(), tabs: conf_guard.tabs.clone() }
+            conf_guard.clone()
         };
         
         if let Ok(new_records) = log_notifications(&listener, &mut last_known_notifs, &current_config) {
@@ -276,10 +240,21 @@ async fn run_background_logger(log_history: Arc<Mutex<Vec<NotificationRecord>>>,
                     for r in new_records.into_iter().rev() {
                         hist.insert(0, r); // newest on top
                     }
-                    if let RetentionStrategy::KeepLastN(max_n) = current_config.retention {
-                        hist.truncate(max_n);
-                    } else {
-                         hist.truncate(50000);
+                    let now = chrono::Local::now().naive_local();
+                    match current_config.display_mode {
+                        DisplayMode::Count(max_n) => {
+                            hist.truncate(max_n);
+                        }
+                        DisplayMode::Days(d) => {
+                            let threshold = now - chrono::Duration::days(d as i64);
+                            hist.retain(|rec| {
+                                if let Ok(dt) = chrono::NaiveDateTime::parse_from_str(&rec.timestamp, "%Y-%m-%d %H:%M:%S") {
+                                    dt >= threshold
+                                } else {
+                                    true
+                                }
+                            });
+                        }
                     }
                     ctx_repainter.request_repaint();
                 }
@@ -306,6 +281,7 @@ struct LoggerApp {
     config: Arc<Mutex<AppConfig>>,
     active_tab: String,
     n_input: String,
+    d_input: String,
     sort_order: SortOrder,
     search_query: String,
 }
@@ -315,8 +291,6 @@ impl LoggerApp {
         let _ = fs::create_dir_all("logs");
         
         setup_custom_fonts(&cc.egui_ctx);
-        
-        let mut history = Vec::new();
         
         // Load Settings
         let mut config = AppConfig::default();
@@ -336,11 +310,12 @@ impl LoggerApp {
         
         let config_arc = Arc::new(Mutex::new(config.clone()));
         
-        // Load history from the current active file
-        let log_file = get_log_file_path(&config.retention);
-        Self::load_history_from_file(&log_file, &mut history);
+        // Ensure starting log is touched
+        let _ = init_csv(&PathBuf::from(format!("logs/WinNotiCatcher_log_{}.csv", get_startup_time())));
 
-        let history_arc = Arc::new(Mutex::new(history));
+        // Load history
+        let temp_history = Self::load_history(&config);
+        let history_arc = Arc::new(Mutex::new(temp_history));
         
         let hist_clone = Arc::clone(&history_arc);
         let conf_clone = Arc::clone(&config_arc);
@@ -353,29 +328,61 @@ impl LoggerApp {
             });
         });
 
-        let mut n_in = String::from("3000");
-        if let RetentionStrategy::KeepLastN(n) = config.retention {
-            n_in = n.to_string();
+        let mut n_input = "3000".to_string();
+        let mut d_input = "3".to_string();
+        match config.display_mode {
+            DisplayMode::Count(c) => n_input = c.to_string(),
+            DisplayMode::Days(d) => d_input = d.to_string(),
         }
 
         Self {
             history: history_arc,
             config: config_arc,
             active_tab: "All".to_string(),
-            n_input: n_in,
+            n_input,
+            d_input,
             sort_order: SortOrder::Descending, // Default Newest first
             search_query: String::new(),
         }
     }
     
-    fn load_history_from_file(path: &Path, history: &mut Vec<NotificationRecord>) {
-        if path.exists() {
-            if let Ok(mut rdr) = csv::ReaderBuilder::new().has_headers(true).from_path(path) {
-                let mut temp = Vec::new();
+    fn load_history(config: &AppConfig) -> Vec<NotificationRecord> {
+        let mut all_records = Vec::new();
+
+        let mut log_files = Vec::new();
+        if let Ok(entries) = fs::read_dir("logs") {
+            for entry in entries.flatten() {
+                let path = entry.path();
+                if path.extension().and_then(|e| e.to_str()) == Some("csv") {
+                    log_files.push(path);
+                }
+            }
+        }
+        log_files.sort(); 
+        log_files.reverse(); 
+        
+        let now = chrono::Local::now().naive_local();
+        
+        let (max_count, max_days) = match config.display_mode {
+            DisplayMode::Count(c) => (Some(c), None),
+            DisplayMode::Days(d) => (None, Some(d)),
+        };
+        
+        let threshold = max_days.map(|d| now - chrono::Duration::days(d as i64));
+
+        for file_path in log_files {
+            if let Some(c) = max_count {
+                if all_records.len() >= c {
+                    break;
+                }
+            }
+            
+            let mut file_records = Vec::new();
+            if let Ok(mut rdr) = csv::ReaderBuilder::new().has_headers(true).from_path(&file_path) {
                 for result in rdr.records() {
                     if let Ok(record) = result {
                         if record.len() >= 3 {
-                            temp.push(NotificationRecord {
+                            file_records.push(NotificationRecord {
                                 timestamp: record[0].to_string(),
                                 app: record[1].to_string(),
                                 text: record[2].to_string(),
@@ -383,10 +390,34 @@ impl LoggerApp {
                         }
                     }
                 }
-                temp.reverse(); // Newest first
-                *history = temp;
+            }
+            
+            file_records.reverse(); 
+            
+            let mut hit_limit = false;
+            for rec in file_records {
+                if let Some(c) = max_count {
+                    if all_records.len() >= c {
+                        hit_limit = true;
+                        break;
+                    }
+                }
+                if let Some(t) = threshold {
+                    if let Ok(dt) = chrono::NaiveDateTime::parse_from_str(&rec.timestamp, "%Y-%m-%d %H:%M:%S") {
+                        if dt < t {
+                            hit_limit = true;
+                            break; 
+                        }
+                    }
+                }
+                all_records.push(rec);
+            }
+            if hit_limit {
+                break;
             }
         }
+
+        all_records 
     }
     
     fn save_config(&self) {
@@ -524,35 +555,57 @@ impl eframe::App for LoggerApp {
                 ui.add_space(10.0);
                 
                 ui.group(|ui| {
-                    ui.label("Retention Strategy (Saving format):");
+                    ui.label("Display Strategy (How many logs to load & show):");
                     ui.add_space(5.0);
-                    if ui.radio_value(&mut conf.retention, RetentionStrategy::KeepAll, "Keep All - Uncut single history file").clicked() { strategy_changed = true; }
                     
-                    let is_keep_n = matches!(conf.retention, RetentionStrategy::KeepLastN(_));
+                    let is_days = matches!(conf.display_mode, DisplayMode::Days(_));
+                    let is_count = matches!(conf.display_mode, DisplayMode::Count(_));
+                    
                     ui.horizontal(|ui| {
-                        if ui.radio(is_keep_n, "Keep Last").clicked() {
-                            if let Ok(n) = self.n_input.parse::<usize>() {
-                                conf.retention = RetentionStrategy::KeepLastN(n);
+                        if ui.radio(is_days, "Display by Days").clicked() {
+                            if let Ok(d) = self.d_input.parse::<usize>() {
+                                conf.display_mode = DisplayMode::Days(d);
                             } else {
-                                conf.retention = RetentionStrategy::KeepLastN(3000);
-                                self.n_input = "3000".to_string();
+                                conf.display_mode = DisplayMode::Days(3);
+                                self.d_input = "3".to_string();
                             }
                             strategy_changed = true;
                         }
-                        if is_keep_n {
-                            let response = ui.add(egui::TextEdit::singleline(&mut self.n_input).desired_width(50.0));
-                            ui.label("records. (Older records will be archived to 'notifications_archive.csv')");
+                        if is_days {
+                            let response = ui.add(egui::TextEdit::singleline(&mut self.d_input).desired_width(50.0));
+                            ui.label("days limit.");
                             
                             if response.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter)) {
-                                 if let Ok(n) = self.n_input.parse::<usize>() {
-                                    conf.retention = RetentionStrategy::KeepLastN(n);
+                                 if let Ok(d) = self.d_input.parse::<usize>() {
+                                    conf.display_mode = DisplayMode::Days(d);
                                     strategy_changed = true;
                                 }
                             }
                         }
                     });
-                    
-                    if ui.radio_value(&mut conf.retention, RetentionStrategy::DailyLogs, "Daily Logs - Split logs into daily files").clicked() { strategy_changed = true; }
+
+                    ui.horizontal(|ui| {
+                        if ui.radio(is_count, "Display by Count").clicked() {
+                            if let Ok(n) = self.n_input.parse::<usize>() {
+                                conf.display_mode = DisplayMode::Count(n);
+                            } else {
+                                conf.display_mode = DisplayMode::Count(3000);
+                                self.n_input = "3000".to_string();
+                            }
+                            strategy_changed = true;
+                        }
+                        if is_count {
+                            let response = ui.add(egui::TextEdit::singleline(&mut self.n_input).desired_width(50.0));
+                            ui.label("logs limit.");
+                            
+                            if response.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter)) {
+                                 if let Ok(n) = self.n_input.parse::<usize>() {
+                                    conf.display_mode = DisplayMode::Count(n);
+                                    strategy_changed = true;
+                                }
+                            }
+                        }
+                    });
                 });
                 
                 if strategy_changed {
@@ -563,16 +616,11 @@ impl eframe::App for LoggerApp {
                 ui.add_space(20.0);
                 ui.group(|ui| {
                     ui.horizontal(|ui| {
-                        ui.label("Erase all logs from the active file:");
-                        if ui.button("Clear Active Logs!").clicked() {
-                            let current_file = get_log_file_path(&conf.retention);
-                            if let Ok(mut file) = OpenOptions::new().write(true).truncate(true).create(true).open(&current_file) {
-                                let _ = writeln!(file, "Timestamp,App,Text");
-                            }
-                            if let Ok(mut hist) = self.history.lock() {
-                                hist.clear();
-                            }
+                        ui.label("Manage old files:");
+                        if ui.button("Open logs folder").clicked() {
+                            let _ = Command::new("explorer").arg("logs").spawn();
                         }
+                        ui.label("(Delete old files here manually to keep your app safe)");
                     });
                 });
             } else {
@@ -660,12 +708,8 @@ impl eframe::App for LoggerApp {
         }
         
         if reload_history {
-            let current_file = {
-                 let conf = self.config.lock().unwrap();
-                 get_log_file_path(&conf.retention)
-            };
-            let mut temp = Vec::new();
-            Self::load_history_from_file(&current_file, &mut temp);
+            let conf = self.config.lock().unwrap().clone();
+            let temp = LoggerApp::load_history(&conf);
             if let Ok(mut hist) = self.history.lock() {
                 *hist = temp;
             }
